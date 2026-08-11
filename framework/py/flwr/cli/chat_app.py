@@ -56,6 +56,7 @@ from flwr.cli.constant import (
     CHAT_EXIT_COMMAND,
     CHAT_EXIT_HINT,
     CHAT_EXPERIMENTAL_WARNING,
+    CHAT_FEDERATION_COMMAND,
     CHAT_FAILURE_EVENTS,
     CHAT_FLOWER_AGENT_APP_SPEC,
     CHAT_FLOWER_LOGO,
@@ -79,6 +80,7 @@ from flwr.proto.control_pb2 import (  # pylint: disable=E0611
     StreamRunEventsRequest,
 )
 from flwr.proto.control_pb2_grpc import ControlStub
+from flwr.proto.federation_pb2 import Federation  # pylint: disable=E0611
 from flwr.proto.task_pb2 import TaskEvent  # pylint: disable=E0611
 from flwr.supercore.typing import JSONObject
 
@@ -97,18 +99,40 @@ class _DetailsBlock:
 class _ChatCommandCompleter(Completer):
     """Complete slash commands in the prompt."""
 
+    def __init__(self, federations: list[Federation]) -> None:
+        self.federations = federations
+
     def get_completions(
         self, document: Document, _complete_event: CompleteEvent
     ) -> Iterable[Completion]:
         """Yield matching slash commands."""
         text = document.text_before_cursor
-        if (
-            document.text_after_cursor
-            or not text.startswith("/")
-            or any(char.isspace() for char in text)
-        ):
+        if document.text_after_cursor or not text.startswith("/"):
             return
 
+        federation_prefix = f"{CHAT_FEDERATION_COMMAND} "
+        if text.startswith(federation_prefix):
+            query = text[len(federation_prefix) :]
+            if any(char.isspace() for char in query):
+                return
+            name_width = max(
+                (len(federation.name) for federation in self.federations), default=0
+            )
+            for federation in self.federations:
+                if federation.name.startswith(query):
+                    yield Completion(
+                        federation.name,
+                        start_position=-len(query),
+                        display=(
+                            f"{federation.name:<{name_width}}        "
+                            f"{federation.description}"
+                        ),
+                        selected_style="#ffffff bg:#dc8400 noreverse",
+                    )
+            return
+
+        if any(char.isspace() for char in text):
+            return
         command_width = max(len(command) for command in CHAT_COMMANDS)
         for command, description in CHAT_COMMANDS.items():
             if command.startswith(text):
@@ -131,9 +155,15 @@ class _FullWidthCompletionsMenuControl(CompletionsMenuControl):
 class ChatApplication:  # pylint: disable=too-many-instance-attributes
     """Persistent full-screen Flower Chat application."""
 
-    def __init__(self, stub: ControlStub, federation: str | None) -> None:
+    def __init__(
+        self,
+        stub: ControlStub,
+        federation: str | None,
+        federations: list[Federation],
+    ) -> None:
         self.stub = stub
         self.federation = federation
+        self.federations = federations
         self.series_id: int | None = None
         self.run_id: int | None = None
         self.busy = False
@@ -145,7 +175,7 @@ class ChatApplication:  # pylint: disable=too-many-instance-attributes
         self.follow_transcript = True
         self.status = ""
         self.input_buffer = Buffer(
-            completer=_ChatCommandCompleter(),
+            completer=_ChatCommandCompleter(federations),
             complete_while_typing=True,
         )
         self.application = self._create_application()
@@ -306,7 +336,35 @@ class ChatApplication:  # pylint: disable=too-many-instance-attributes
                 f"{CHAT_NEW_CONVERSATION_MESSAGE}\n\n",
             )
             return True
+        if command == CHAT_FEDERATION_COMMAND or command.startswith(
+            f"{CHAT_FEDERATION_COMMAND} "
+        ):
+            return self._handle_federation_command(event, prompt)
         return False
+
+    def _handle_federation_command(self, event: KeyPressEvent, prompt: str) -> bool:
+        """Show the federation selector or apply its selection."""
+        if prompt.lower() == CHAT_FEDERATION_COMMAND:
+            self.input_buffer.text = f"{CHAT_FEDERATION_COMMAND} "
+            self.input_buffer.start_completion(select_first=False)
+            event.app.invalidate()
+            return True
+        federation_prefix = f"{CHAT_FEDERATION_COMMAND} "
+        federation_name = prompt[len(federation_prefix) :]
+        if federation_name not in {federation.name for federation in self.federations}:
+            self._append_transcript(
+                "class:error",
+                f"Unknown federation: {federation_name}\n\n",
+            )
+            return True
+        self.federation = federation_name
+        self.series_id = None
+        self._append_transcript(
+            "class:notice",
+            f"Federation changed to {federation_name}. "
+            f"{CHAT_NEW_CONVERSATION_MESSAGE}\n\n",
+        )
+        return True
 
     def _interrupt_prompt(self, event: KeyPressEvent) -> None:
         """Exit while idle or stop the active run."""
