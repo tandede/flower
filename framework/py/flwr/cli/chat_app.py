@@ -268,7 +268,7 @@ class ChatApplication:  # pylint: disable=too-many-instance-attributes
         )
         # Build the agent label above the input area.
         agent_name = Window(
-            FormattedTextControl([("class:agent.name", f" ✿ {CHAT_AGENT_NAME} ")]),
+            FormattedTextControl(self._render_agent_name),
             height=1,
             style="class:content",
         )
@@ -552,6 +552,11 @@ class ChatApplication:  # pylint: disable=too-many-instance-attributes
             return []
         frame = CHAT_SPINNER_FRAMES[int(monotonic() * 10) % len(CHAT_SPINNER_FRAMES)]
         return [("class:status", f"{frame} {self.status}")]
+
+    def _render_agent_name(self) -> StyleAndTextTuples:
+        """Return the agent label with the active federation."""
+        federation = self.federation or "default federation"
+        return [("class:agent.name", f" ✿ {CHAT_AGENT_NAME} · {federation} ")]
 
     def _render_transcript(self) -> StyleAndTextTuples:
         """Return transcript text wrapped to the current terminal width."""
