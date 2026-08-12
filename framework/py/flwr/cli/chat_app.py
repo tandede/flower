@@ -53,6 +53,7 @@ from flwr.cli.constant import (
     CHAT_AGENT_NAME,
     CHAT_APP_STYLE,
     CHAT_COMMANDS,
+    CHAT_DEFAULT_FEDERATION_NAME,
     CHAT_EXIT_COMMAND,
     CHAT_EXIT_HINT,
     CHAT_EXPERIMENTAL_WARNING,
@@ -82,6 +83,7 @@ from flwr.proto.control_pb2 import (  # pylint: disable=E0611
 from flwr.proto.control_pb2_grpc import ControlStub
 from flwr.proto.federation_pb2 import Federation  # pylint: disable=E0611
 from flwr.proto.task_pb2 import TaskEvent  # pylint: disable=E0611
+from flwr.supercore.constant import DEFAULT_FEDERATION_SIMULATION
 from flwr.supercore.typing import JSONObject
 
 from .utils import flwr_cli_grpc_exc_handler
@@ -162,7 +164,7 @@ class ChatApplication:  # pylint: disable=too-many-instance-attributes
         federations: list[Federation],
     ) -> None:
         self.stub = stub
-        self.federation = federation
+        self.federation = federation or _resolve_default_chat_federation(federations)
         self.federations = federations
         self.series_id: int | None = None
         self.run_id: int | None = None
@@ -555,8 +557,7 @@ class ChatApplication:  # pylint: disable=too-many-instance-attributes
 
     def _render_agent_name(self) -> StyleAndTextTuples:
         """Return the agent label with the active federation."""
-        federation = self.federation or "default federation"
-        return [("class:agent.name", f" ✿ {CHAT_AGENT_NAME} · {federation} ")]
+        return [("class:agent.name", f" ✿ {CHAT_AGENT_NAME} · {self.federation} ")]
 
     def _render_transcript(self) -> StyleAndTextTuples:
         """Return transcript text wrapped to the current terminal width."""
@@ -637,6 +638,21 @@ def parse_task_event(task_event: TaskEvent) -> tuple[str, JSONObject]:
     if not event_type:
         event_type = cast(str, payload.get("type", ""))
     return event_type, payload
+
+
+def _resolve_default_chat_federation(federations: list[Federation]) -> str | None:
+    """Resolve the account-scoped default federation used by Flower Chat."""
+    execution_suffix = f"/{CHAT_DEFAULT_FEDERATION_NAME}"
+    for federation in federations:
+        if federation.name.endswith(execution_suffix):
+            return federation.name
+
+    workspace_suffix = f"/{DEFAULT_FEDERATION_SIMULATION}"
+    for federation in federations:
+        if federation.name.endswith(workspace_suffix):
+            account_name = federation.name[: -len(workspace_suffix)]
+            return f"{account_name}{execution_suffix}"
+    return None
 
 
 def format_chat_help() -> str:
