@@ -77,7 +77,6 @@ from flwr.cli.constant import (
 )
 from flwr.common.serde import user_config_to_proto
 from flwr.proto.control_pb2 import (  # pylint: disable=E0611
-    GetRunSeriesRequest,
     ListRunSeriesRequest,
     StartRunRequest,
     StopRunRequest,
@@ -350,9 +349,6 @@ class ChatApplication:  # pylint: disable=too-many-instance-attributes
         if command == CHAT_HISTORY_COMMAND:
             self._show_history()
             return True
-        if command.startswith(f"{CHAT_HISTORY_COMMAND} "):
-            self._select_history(prompt)
-            return True
         if command == CHAT_FEDERATION_COMMAND or command.startswith(
             f"{CHAT_FEDERATION_COMMAND} "
         ):
@@ -415,7 +411,11 @@ class ChatApplication:  # pylint: disable=too-many-instance-attributes
             return
         entry = self.history_block.entries[self.history_block.selected_index]
         self._close_history_selection()
-        self._select_history_id(entry.series_id)
+        self.series_id = entry.series_id
+        self._append_transcript(
+            "class:notice",
+            f"Continuing conversation {entry.series_id}.\n\n",
+        )
 
     def _cancel_history_selection(self) -> None:
         """Close conversation history without selecting a conversation."""
@@ -433,47 +433,6 @@ class ChatApplication:  # pylint: disable=too-many-instance-attributes
         self.follow_transcript = True
         self.transcript_revision += 1
         self.application.invalidate()
-
-    def _select_history(self, prompt: str) -> None:
-        """Continue a conversation from the default chat federation."""
-        series_id_text = prompt[len(CHAT_HISTORY_COMMAND) :].strip()
-        try:
-            series_id = int(series_id_text)
-            if not 0 <= series_id < 1 << 64:
-                raise ValueError
-        except ValueError:
-            self._append_transcript(
-                "class:error",
-                f"Usage: {CHAT_HISTORY_COMMAND} <series-id>\n\n",
-            )
-            return
-
-        self._select_history_id(series_id)
-
-    def _select_history_id(self, series_id: int) -> None:
-        """Validate and continue a conversation by RunSeries ID."""
-        try:
-            with flwr_cli_grpc_exc_handler():
-                response = self.stub.GetRunSeries(
-                    GetRunSeriesRequest(series_id=series_id)
-                )
-        except click.ClickException as exc:
-            self._append_transcript("class:error", f"Error: {exc.format_message()}\n\n")
-            return
-
-        if response.series.federation != self.federation:
-            self._append_transcript(
-                "class:error",
-                f"Conversation {series_id} does not belong to "
-                f"{self.federation}.\n\n",
-            )
-            return
-
-        self.series_id = series_id
-        self._append_transcript(
-            "class:notice",
-            f"Continuing conversation {series_id}.\n\n",
-        )
 
     def _interrupt_prompt(self, event: KeyPressEvent) -> None:
         """Exit while idle or stop the active run."""

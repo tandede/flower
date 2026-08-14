@@ -24,30 +24,22 @@ from flwr.cli.chat_app import ChatApplication, _ChatCommandCompleter
 from flwr.proto.federation_pb2 import Federation  # pylint: disable=E0611
 
 
-def test_chat_completes_history_command() -> None:
-    """History should be offered as a slash command."""
+def test_chat_completes_history_but_not_federation() -> None:
+    """Only the enabled history command should be completed."""
     completer = _ChatCommandCompleter()
 
-    completions = list(completer.get_completions(Document("/hist"), CompleteEvent()))
-
-    assert [completion.text for completion in completions] == ["/history"]
-
-
-def test_chat_does_not_complete_federation_command() -> None:
-    """The disabled federation command should not produce a completion."""
-    completer = _ChatCommandCompleter()
-
-    completions = list(
+    history = list(completer.get_completions(Document("/hist"), CompleteEvent()))
+    federation = list(
         completer.get_completions(Document("/federation"), CompleteEvent())
     )
 
-    assert completions == []
+    assert [completion.text for completion in history] == ["/history"]
+    assert federation == []
 
 
-def test_chat_does_not_handle_federation_command() -> None:
-    """The disabled federation command should not change the active federation."""
-    application = Mock()
-    with patch.object(ChatApplication, "_create_application", return_value=application):
+def test_chat_always_uses_default_federation() -> None:
+    """Chat should use the default federation and reject federation changes."""
+    with patch.object(ChatApplication, "_create_application", return_value=Mock()):
         chat = ChatApplication(Mock(), [Federation(name="@flower/workspace")])
     chat.series_id = 123
 
@@ -58,19 +50,4 @@ def test_chat_does_not_handle_federation_command() -> None:
     assert chat.series_id == 123
     assert chat.transcript == [
         ("class:notice", "/federation is currently disabled.\n\n")
-    ]
-
-
-def test_chat_uses_and_shows_default_federation() -> None:
-    """Chat should use and show the dedicated default federation."""
-    federations = [Federation(name="@flower/workspace")]
-    with patch.object(ChatApplication, "_create_application", return_value=Mock()):
-        chat = ChatApplication(Mock(), federations)
-
-    assert chat.federation == "@flower/flower-agent-execution"
-    assert chat._render_agent_name() == [
-        (
-            "class:agent.name",
-            " ✿ Flower Agent · @flower/flower-agent-execution ",
-        )
     ]
