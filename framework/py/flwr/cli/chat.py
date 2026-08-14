@@ -39,8 +39,6 @@ def chat() -> None:
             response: ListFederationsResponse = stub.ListFederations(
                 ListFederationsRequest()
             )
-        ChatApplication(
-            stub, superlink_connection.federation, list(response.federations)
-        ).run()
+        ChatApplication(stub, list(response.federations)).run()
     finally:
         channel.close()

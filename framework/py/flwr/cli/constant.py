@@ -54,11 +54,12 @@ CHAT_AGENT_INPUT_KEY = "agent.input"
 CHAT_HELP_COMMAND = "/help"
 CHAT_EXIT_COMMAND = "/quit"
 CHAT_NEW_COMMAND = "/new"
+CHAT_HISTORY_COMMAND = "/history"
 CHAT_FEDERATION_COMMAND = "/federation"
 CHAT_COMMANDS = {
     CHAT_HELP_COMMAND: "Show available commands.",
     CHAT_NEW_COMMAND: "Start a new conversation.",
-    CHAT_FEDERATION_COMMAND: "Select a federation.",
+    CHAT_HISTORY_COMMAND: "Show or continue conversation history.",
     CHAT_EXIT_COMMAND: "Exit Flower Chat.",
 }
 CHAT_REASONING_DELTA_EVENT = "response.reasoning_summary_text.delta"
@@ -79,6 +80,7 @@ CHAT_APP_STYLE = {
     "content": "noinherit",
     "details.header": "bold #dc8400 bg:#292929",
     "details.body": "#d1d5db",
+    "history.selected": "#ffffff bg:#dc8400",
     "status": "#dc8400",
     "completion-menu": "fg:#ffffff bg:#404040",
     "completion-menu.completion": "fg:#ffffff bg:#404040",

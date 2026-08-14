@@ -62,6 +62,7 @@ from flwr.cli.constant import (
     CHAT_FLOWER_AGENT_APP_SPEC,
     CHAT_FLOWER_LOGO,
     CHAT_HELP_COMMAND,
+    CHAT_HISTORY_COMMAND,
     CHAT_NEW_COMMAND,
     CHAT_NEW_CONVERSATION_MESSAGE,
     CHAT_REASONING_DELTA_EVENT,
@@ -76,12 +77,15 @@ from flwr.cli.constant import (
 )
 from flwr.common.serde import user_config_to_proto
 from flwr.proto.control_pb2 import (  # pylint: disable=E0611
+    GetRunSeriesRequest,
+    ListRunSeriesRequest,
     StartRunRequest,
     StopRunRequest,
     StreamRunEventsRequest,
 )
 from flwr.proto.control_pb2_grpc import ControlStub
 from flwr.proto.federation_pb2 import Federation  # pylint: disable=E0611
+from flwr.proto.runseries_pb2 import RunSeries  # pylint: disable=E0611
 from flwr.proto.task_pb2 import TaskEvent  # pylint: disable=E0611
 from flwr.supercore.constant import DEFAULT_FEDERATION_SIMULATION
 from flwr.supercore.typing import JSONObject
@@ -98,11 +102,17 @@ class _DetailsBlock:
     expanded: bool = False
 
 
+@dataclass
+class _HistoryBlock:
+    """Interactive conversation history shown inside the transcript."""
+
+    federation: str
+    entries: list[RunSeries]
+    selected_index: int = 0
+
+
 class _ChatCommandCompleter(Completer):
     """Complete slash commands in the prompt."""
-
-    def __init__(self, federations: list[Federation]) -> None:
-        self.federations = federations
 
     def get_completions(
         self, document: Document, _complete_event: CompleteEvent
@@ -110,27 +120,6 @@ class _ChatCommandCompleter(Completer):
         """Yield matching slash commands."""
         text = document.text_before_cursor
         if document.text_after_cursor or not text.startswith("/"):
-            return
-
-        federation_prefix = f"{CHAT_FEDERATION_COMMAND} "
-        if text.startswith(federation_prefix):
-            query = text[len(federation_prefix) :]
-            if any(char.isspace() for char in query):
-                return
-            name_width = max(
-                (len(federation.name) for federation in self.federations), default=0
-            )
-            for federation in self.federations:
-                if federation.name.startswith(query):
-                    yield Completion(
-                        federation.name,
-                        start_position=-len(query),
-                        display=(
-                            f"{federation.name:<{name_width}}        "
-                            f"{federation.description}"
-                        ),
-                        selected_style="#ffffff bg:#dc8400 noreverse",
-                    )
             return
 
         if any(char.isspace() for char in text):
@@ -160,24 +149,23 @@ class ChatApplication:  # pylint: disable=too-many-instance-attributes
     def __init__(
         self,
         stub: ControlStub,
-        federation: str | None,
         federations: list[Federation],
     ) -> None:
         self.stub = stub
-        self.federation = federation or _resolve_default_chat_federation(federations)
-        self.federations = federations
+        self.federation = _resolve_default_chat_federation(federations)
         self.series_id: int | None = None
         self.run_id: int | None = None
         self.busy = False
         self.cancel_requested = False
-        self.transcript: list[tuple[str, str] | _DetailsBlock] = []
+        self.transcript: list[tuple[str, str] | _DetailsBlock | _HistoryBlock] = []
+        self.history_block: _HistoryBlock | None = None
         self.wrapped_transcript: StyleAndTextTuples = []
         self.wrapped_transcript_key: tuple[int, int] | None = None
         self.transcript_revision = 0
         self.follow_transcript = True
         self.status = ""
         self.input_buffer = Buffer(
-            completer=_ChatCommandCompleter(federations),
+            completer=_ChatCommandCompleter(),
             complete_while_typing=True,
         )
         self.application = self._create_application()
@@ -194,7 +182,28 @@ class ChatApplication:  # pylint: disable=too-many-instance-attributes
         # Register prompt submission and interruption shortcuts.
         @key_bindings.add("enter")
         def _submit_prompt(event: KeyPressEvent) -> None:
+            if self.history_block is not None:
+                self._confirm_history_selection()
+                return
             self._submit_prompt(event)
+
+        @key_bindings.add(
+            "up", filter=Condition(lambda: self.history_block is not None)
+        )
+        def _select_previous_history(_: KeyPressEvent) -> None:
+            self._move_history_selection(-1)
+
+        @key_bindings.add(
+            "down", filter=Condition(lambda: self.history_block is not None)
+        )
+        def _select_next_history(_: KeyPressEvent) -> None:
+            self._move_history_selection(1)
+
+        @key_bindings.add(
+            "escape", filter=Condition(lambda: self.history_block is not None)
+        )
+        def _cancel_history(_: KeyPressEvent) -> None:
+            self._cancel_history_selection()
 
         @key_bindings.add("c-c")
         def _interrupt_prompt(event: KeyPressEvent) -> None:
@@ -338,38 +347,139 @@ class ChatApplication:  # pylint: disable=too-many-instance-attributes
                 f"{CHAT_NEW_CONVERSATION_MESSAGE}\n\n",
             )
             return True
+        if command == CHAT_HISTORY_COMMAND:
+            self._show_history()
+            return True
+        if command.startswith(f"{CHAT_HISTORY_COMMAND} "):
+            self._select_history(prompt)
+            return True
         if command == CHAT_FEDERATION_COMMAND or command.startswith(
             f"{CHAT_FEDERATION_COMMAND} "
         ):
-            return self._handle_federation_command(event, prompt)
-        return False
-
-    def _handle_federation_command(self, event: KeyPressEvent, prompt: str) -> bool:
-        """Show the federation selector or apply its selection."""
-        if prompt.lower() == CHAT_FEDERATION_COMMAND:
-            self.input_buffer.text = f"{CHAT_FEDERATION_COMMAND} "
-            self.input_buffer.start_completion(select_first=False)
-            event.app.invalidate()
-            return True
-        federation_prefix = f"{CHAT_FEDERATION_COMMAND} "
-        federation_name = prompt[len(federation_prefix) :]
-        if federation_name not in {federation.name for federation in self.federations}:
             self._append_transcript(
-                "class:error",
-                f"Unknown federation: {federation_name}\n\n",
+                "class:notice",
+                f"{CHAT_FEDERATION_COMMAND} is currently disabled.\n\n",
             )
             return True
-        self.federation = federation_name
-        self.series_id = None
+        return False
+
+    def _show_history(self) -> None:
+        """Show conversation history for the default chat federation."""
+        if self.federation is None:
+            self._append_transcript(
+                "class:error", "The default chat federation is unavailable.\n\n"
+            )
+            return
+        try:
+            with flwr_cli_grpc_exc_handler():
+                response = self.stub.ListRunSeries(
+                    ListRunSeriesRequest(federation_id=self.federation)
+                )
+        except click.ClickException as exc:
+            self._append_transcript("class:error", f"Error: {exc.format_message()}\n\n")
+            return
+        # ListRunSeries returns newest first; render chronologically so the latest
+        # conversation is at the bottom.
+        entries = list(reversed(response.entries))
+        if not entries:
+            self._append_transcript(
+                "class:notice",
+                f"No conversation history found for {self.federation}.\n\n",
+            )
+            return
+        block = _HistoryBlock(
+            self.federation,
+            entries,
+            selected_index=len(entries) - 1,
+        )
+        self.history_block = block
+        self.follow_transcript = True
+        self.transcript.append(block)
+        self.transcript_revision += 1
+        self.application.invalidate()
+
+    def _move_history_selection(self, offset: int) -> None:
+        """Move the highlighted conversation history row."""
+        if self.history_block is None:
+            return
+        entry_count = len(self.history_block.entries)
+        self.history_block.selected_index = (
+            self.history_block.selected_index + offset
+        ) % entry_count
+        self.transcript_revision += 1
+        self.application.invalidate()
+
+    def _confirm_history_selection(self) -> None:
+        """Continue the highlighted conversation."""
+        if self.history_block is None:
+            return
+        entry = self.history_block.entries[self.history_block.selected_index]
+        self._close_history_selection()
+        self._select_history_id(entry.series_id)
+
+    def _cancel_history_selection(self) -> None:
+        """Close conversation history without selecting a conversation."""
+        if self.history_block is None:
+            return
+        self._close_history_selection()
+        self._append_transcript("class:notice", "History selection cancelled.\n\n")
+
+    def _close_history_selection(self) -> None:
+        """Remove the active conversation history block."""
+        if self.history_block is None:
+            return
+        self.transcript.remove(self.history_block)
+        self.history_block = None
+        self.follow_transcript = True
+        self.transcript_revision += 1
+        self.application.invalidate()
+
+    def _select_history(self, prompt: str) -> None:
+        """Continue a conversation from the default chat federation."""
+        series_id_text = prompt[len(CHAT_HISTORY_COMMAND) :].strip()
+        try:
+            series_id = int(series_id_text)
+            if not 0 <= series_id < 1 << 64:
+                raise ValueError
+        except ValueError:
+            self._append_transcript(
+                "class:error",
+                f"Usage: {CHAT_HISTORY_COMMAND} <series-id>\n\n",
+            )
+            return
+
+        self._select_history_id(series_id)
+
+    def _select_history_id(self, series_id: int) -> None:
+        """Validate and continue a conversation by RunSeries ID."""
+        try:
+            with flwr_cli_grpc_exc_handler():
+                response = self.stub.GetRunSeries(
+                    GetRunSeriesRequest(series_id=series_id)
+                )
+        except click.ClickException as exc:
+            self._append_transcript("class:error", f"Error: {exc.format_message()}\n\n")
+            return
+
+        if response.series.federation != self.federation:
+            self._append_transcript(
+                "class:error",
+                f"Conversation {series_id} does not belong to "
+                f"{self.federation}.\n\n",
+            )
+            return
+
+        self.series_id = series_id
         self._append_transcript(
             "class:notice",
-            f"Federation changed to {federation_name}. "
-            f"{CHAT_NEW_CONVERSATION_MESSAGE}\n\n",
+            f"Continuing conversation {series_id}.\n\n",
         )
-        return True
 
     def _interrupt_prompt(self, event: KeyPressEvent) -> None:
         """Exit while idle or stop the active run."""
+        if self.history_block is not None:
+            self._cancel_history_selection()
+            return
         # Clear a draft or exit when no run is active.
         if not self.busy:
             if self.input_buffer.text:
@@ -579,6 +689,8 @@ class ChatApplication:  # pylint: disable=too-many-instance-attributes
             for entry in self.transcript:
                 if isinstance(entry, _DetailsBlock):
                     fragments.extend(self._render_details_block(entry, width))
+                elif isinstance(entry, _HistoryBlock):
+                    fragments.extend(self._render_history_block(entry, width))
                 else:
                     fragments.append(entry)
             self.wrapped_transcript = _wrap_transcript_fragments(fragments, width)
@@ -610,8 +722,44 @@ class ChatApplication:  # pylint: disable=too-many-instance-attributes
         fragments.append(("", "\n"))
         return fragments
 
+    def _render_history_block(
+        self, block: _HistoryBlock, width: int
+    ) -> StyleAndTextTuples:
+        """Render the interactive conversation history selector."""
+        fragments: StyleAndTextTuples = [
+            ("class:notice", f"Conversation history for {block.federation}:\n")
+        ]
+        series_width = max(len(str(entry.series_id)) for entry in block.entries)
+        for index, entry in enumerate(block.entries):
+            marker = "❯" if index == block.selected_index else " "
+            row = (
+                f" {marker} {entry.series_id:>{series_width}}  "
+                f"{entry.description or '(no description)'}"
+            )
+            row = _truncate_to_width(row, width)
+            if index == block.selected_index:
+                row += " " * max(0, width - get_cwidth(row))
+            style = "class:history.selected" if index == block.selected_index else ""
+            fragments.append((style, f"{row}\n"))
+        fragments.append(
+            (
+                "class:notice",
+                "\nUp/Down to select · Enter to continue · Esc to cancel\n\n",
+            )
+        )
+        return fragments
+
     def _transcript_cursor(self) -> Point:
         """Keep the transcript scrolled to its last line."""
+        if self.history_block is not None:
+            # The Window follows this cursor, keeping the highlighted history row
+            # visible as the user moves beyond either viewport edge.
+            selected_line = 0
+            for fragment in self.wrapped_transcript:
+                if fragment[0] == "class:history.selected":
+                    return Point(x=0, y=selected_line)
+                selected_line += fragment[1].count("\n")
+
         # Cursor rows must match the manually wrapped transcript lines.
         wrapped_text = "".join(fragment[1] for fragment in self.wrapped_transcript)
         lines = wrapped_text.split("\n")
@@ -662,6 +810,27 @@ def format_chat_help() -> str:
     for command, description in CHAT_COMMANDS.items():
         lines.append(f"  {command:<{command_width}} {description}")
     return "\n".join(lines) + "\n\n"
+
+
+def _truncate_to_width(text: str, width: int) -> str:
+    """Truncate text to a display-cell width, adding an ellipsis if needed."""
+    if get_cwidth(text) <= width:
+        return text
+
+    ellipsis = "…"
+    content_width = width - get_cwidth(ellipsis)
+    if content_width <= 0:
+        return ellipsis if width > 0 else ""
+
+    truncated: list[str] = []
+    current_width = 0
+    for char in text:
+        char_width = get_cwidth(char)
+        if current_width + char_width > content_width:
+            break
+        truncated.append(char)
+        current_width += char_width
+    return f"{''.join(truncated)}{ellipsis}"
 
 
 def start_chat_run(

@@ -67,6 +67,7 @@ def test_chat_runs_interactive_application() -> None:
     superlink_connection = SuperLinkConnection(
         name=CHAT_SUPERGRID_CONNECTION_NAME,
         address="supergrid.flower.ai",
+        federation="@flower/other",
     )
     channel = Mock()
     stub = Mock()
@@ -90,6 +91,6 @@ def test_chat_runs_interactive_application() -> None:
         chat_module.chat()
 
     stub.ListFederations.assert_called_once()
-    mock_chat_application.assert_called_once_with(stub, None, federations)
+    mock_chat_application.assert_called_once_with(stub, federations)
     mock_chat_application.return_value.run.assert_called_once_with()
     channel.close.assert_called_once()
