@@ -17,15 +17,24 @@
 
 import asyncio
 import json
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass
+from threading import Lock
 from time import monotonic
-from typing import cast
+from types import NoneType
+from typing import Any, cast
 
 import click
+import requests
 from prompt_toolkit.application import Application
 from prompt_toolkit.buffer import Buffer, CompletionState
-from prompt_toolkit.completion import CompleteEvent, Completer, Completion
+from prompt_toolkit.completion import (
+    CompleteEvent,
+    Completer,
+    Completion,
+    ThreadedCompleter,
+)
 from prompt_toolkit.data_structures import Point
 from prompt_toolkit.document import Document
 from prompt_toolkit.filters import Condition, has_completions, is_done
@@ -47,18 +56,23 @@ from prompt_toolkit.mouse_events import MouseEvent, MouseEventType
 from prompt_toolkit.styles import Style
 from prompt_toolkit.utils import get_cwidth
 from prompt_toolkit.widgets import Frame
+from rich.console import Console
+from rich.markdown import Markdown
+from rich.style import Style as RichStyle
 
+from flwr.app import ConfigRecord
 from flwr.cli.constant import (
     CHAT_AGENT_INPUT_KEY,
     CHAT_AGENT_NAME,
+    CHAT_AGENTS_API_PATH,
     CHAT_APP_STYLE,
     CHAT_COMMANDS,
     CHAT_DEFAULT_FEDERATION_NAME,
     CHAT_EXIT_COMMAND,
     CHAT_EXIT_HINT,
     CHAT_EXPERIMENTAL_WARNING,
-    CHAT_FEDERATION_COMMAND,
     CHAT_FAILURE_EVENTS,
+    CHAT_FEDERATION_COMMAND,
     CHAT_FLOWER_AGENT_APP_SPEC,
     CHAT_FLOWER_LOGO,
     CHAT_HELP_COMMAND,
@@ -75,20 +89,28 @@ from flwr.cli.constant import (
     CHAT_WEB_SEARCH_CONNECTOR_REF,
     CHAT_WELCOME_MESSAGE,
 )
-from flwr.common.serde import user_config_to_proto
+from flwr.common.serde import context_from_proto, user_config_to_proto
 from flwr.proto.control_pb2 import (  # pylint: disable=E0611
+    GetRunSeriesRequest,
     ListRunSeriesRequest,
     StartRunRequest,
     StopRunRequest,
     StreamRunEventsRequest,
 )
 from flwr.proto.control_pb2_grpc import ControlStub
+from flwr.proto.fab_pb2 import Fab  # pylint: disable=E0611
 from flwr.proto.federation_pb2 import Federation  # pylint: disable=E0611
+from flwr.proto.message_pb2 import Context as ProtoContext  # pylint: disable=E0611
 from flwr.proto.runseries_pb2 import RunSeries  # pylint: disable=E0611
 from flwr.proto.task_pb2 import TaskEvent  # pylint: disable=E0611
-from flwr.supercore.constant import DEFAULT_FEDERATION_SIMULATION
+from flwr.supercore.constant import (
+    APP_ID_PATTERN,
+    DEFAULT_FEDERATION_SIMULATION,
+    FLWR_SUPERGRID_API_URL,
+)
 from flwr.supercore.typing import JSONObject
 
+from .auth_plugin import CliAuthPlugin, OidcCliPlugin
 from .utils import flwr_cli_grpc_exc_handler
 
 
@@ -102,6 +124,13 @@ class _DetailsBlock:
 
 
 @dataclass
+class _MarkdownBlock:
+    """Markdown-formatted assistant message shown in the transcript."""
+
+    body: str = ""
+
+
+@dataclass
 class _HistoryBlock:
     """Interactive conversation history shown inside the transcript."""
 
@@ -110,28 +139,109 @@ class _HistoryBlock:
     selected_index: int = 0
 
 
-class _ChatCommandCompleter(Completer):
-    """Complete slash commands in the prompt."""
+@dataclass(frozen=True)
+class _Agent:
+    """Agent available to Flower Chat."""
+
+    app_spec: str
+    display_name: str
+    description: str
+    fab_hash: str | None
+
+
+class _ChatCompleter(Completer):
+    """Complete slash commands and agents in the prompt."""
+
+    def __init__(
+        self,
+        auth_plugin: CliAuthPlugin,
+        federation: str | None,
+        federations: list[Federation] | None = None,
+    ) -> None:
+        self.auth_plugin = auth_plugin
+        self.federation = federation
+        self.federations = federations or []
+        self.agents: list[_Agent] | None = None
+        self._agents_lock = Lock()
+
+    def load_agents(self) -> list[_Agent]:
+        """Load and cache the available agents."""
+        with self._agents_lock:
+            if self.agents is None:
+                self.agents = fetch_chat_agents(self.auth_plugin, self.federation)
+            return self.agents
+
+    def set_federation(self, federation: str) -> None:
+        """Select a federation and clear cached agent completions."""
+        with self._agents_lock:
+            self.federation = federation
+            self.agents = None
 
     def get_completions(
         self, document: Document, _complete_event: CompleteEvent
     ) -> Iterable[Completion]:
-        """Yield matching slash commands."""
+        """Yield matching commands or agents."""
         text = document.text_before_cursor
-        if document.text_after_cursor or not text.startswith("/"):
+        if document.text_after_cursor:
+            return
+
+        federation_prefix = f"{CHAT_FEDERATION_COMMAND} "
+        if text.lower().startswith(federation_prefix):
+            query = text[len(federation_prefix) :]
+            if any(char.isspace() for char in query):
+                return
+            name_width = max(
+                (len(federation.name) for federation in self.federations), default=0
+            )
+            for federation in self.federations:
+                if federation.name.lower().startswith(query.lower()):
+                    yield Completion(
+                        federation.name,
+                        start_position=-len(query),
+                        display=(
+                            f"{federation.name:<{name_width}}        "
+                            f"{federation.description}"
+                        ),
+                        selected_style="#ffffff bg:#dc8400 noreverse",
+                    )
             return
 
         if any(char.isspace() for char in text):
             return
-        command_width = max(len(command) for command in CHAT_COMMANDS)
-        for command, description in CHAT_COMMANDS.items():
-            if command.startswith(text):
-                yield Completion(
-                    command,
-                    start_position=-len(text),
-                    display=f"{command:<{command_width}}        {description}",
-                    selected_style="#ffffff bg:#dc8400 noreverse",
-                )
+        if text.startswith("/"):
+            command_width = max(len(command) for command in CHAT_COMMANDS)
+            for command, description in CHAT_COMMANDS.items():
+                if command.startswith(text):
+                    yield Completion(
+                        command,
+                        start_position=-len(text),
+                        display=f"{command:<{command_width}}        {description}",
+                        selected_style="#ffffff bg:#dc8400 noreverse",
+                    )
+            return
+
+        if not text.startswith("@"):
+            return
+        try:
+            agents = self.load_agents()
+        except click.ClickException:
+            return
+
+        matches = [
+            agent for agent in agents if agent.app_spec.lower().startswith(text.lower())
+        ]
+        if not matches:
+            return
+        app_spec_width = max(len(agent.app_spec) for agent in matches)
+        for agent in matches:
+            yield Completion(
+                f"{agent.app_spec} ",
+                start_position=-len(text),
+                display=(
+                    f"{agent.app_spec:<{app_spec_width}}        {agent.description}"
+                ),
+                selected_style="#ffffff bg:#dc8400 noreverse",
+            )
 
 
 class _FullWidthCompletionsMenuControl(CompletionsMenuControl):
@@ -149,22 +259,30 @@ class ChatApplication:  # pylint: disable=too-many-instance-attributes
         self,
         stub: ControlStub,
         federations: list[Federation],
+        auth_plugin: CliAuthPlugin,
     ) -> None:
         self.stub = stub
         self.federation = _resolve_default_chat_federation(federations)
+        self.federations = federations
         self.series_id: int | None = None
         self.run_id: int | None = None
         self.busy = False
         self.cancel_requested = False
-        self.transcript: list[tuple[str, str] | _DetailsBlock | _HistoryBlock] = []
+        self.transcript: list[
+            tuple[str, str] | _DetailsBlock | _MarkdownBlock | _HistoryBlock
+        ] = []
         self.history_block: _HistoryBlock | None = None
         self.wrapped_transcript: StyleAndTextTuples = []
         self.wrapped_transcript_key: tuple[int, int] | None = None
         self.transcript_revision = 0
         self.follow_transcript = True
         self.status = ""
+        self.agent_app_spec = CHAT_FLOWER_AGENT_APP_SPEC
+        self.agent_fab_hash: str | None = None
+        self.agent_name = CHAT_AGENT_NAME
+        self.completer = _ChatCompleter(auth_plugin, self.federation, federations)
         self.input_buffer = Buffer(
-            completer=_ChatCommandCompleter(),
+            completer=ThreadedCompleter(self.completer),
             complete_while_typing=True,
         )
         self.application = self._create_application()
@@ -322,12 +440,39 @@ class ChatApplication:  # pylint: disable=too-many-instance-attributes
         if self._handle_command(event, stripped_prompt):
             return
 
+        selected_agent, prompt = _extract_agent_selection(prompt)
+        if selected_agent is not None:
+            try:
+                agents = self.completer.load_agents()
+            except click.ClickException as exc:
+                self._append_transcript(
+                    "class:error", f"Error: {exc.format_message()}\n\n"
+                )
+                event.app.invalidate()
+                return
+            agent = _find_agent(selected_agent, agents)
+            selected_fab_hash = agent.fab_hash if agent is not None else None
+            if (
+                selected_agent != self.agent_app_spec
+                or selected_fab_hash != self.agent_fab_hash
+            ):
+                self.series_id = None
+            self.agent_app_spec = selected_agent
+            self.agent_fab_hash = selected_fab_hash
+            self.agent_name = (
+                agent.display_name if agent is not None else selected_agent
+            )
+        if not prompt.strip():
+            return
+
         # Start the agent run without blocking the UI event loop.
         self._append_user_message(prompt)
         self.busy = True
         self.cancel_requested = False
         self.status = "Thinking..."
-        event.app.create_background_task(self._run_prompt(prompt))
+        event.app.create_background_task(
+            self._run_prompt(prompt, self.agent_app_spec, self.agent_fab_hash)
+        )
         event.app.invalidate()
 
     def _handle_command(self, event: KeyPressEvent, prompt: str) -> bool:
@@ -341,10 +486,7 @@ class ChatApplication:  # pylint: disable=too-many-instance-attributes
             return True
         if command == CHAT_NEW_COMMAND:
             self.series_id = None
-            self._append_transcript(
-                "class:notice",
-                f"{CHAT_NEW_CONVERSATION_MESSAGE}\n\n",
-            )
+            self._clear_transcript()
             return True
         if command == CHAT_HISTORY_COMMAND:
             self._show_history()
@@ -352,12 +494,35 @@ class ChatApplication:  # pylint: disable=too-many-instance-attributes
         if command == CHAT_FEDERATION_COMMAND or command.startswith(
             f"{CHAT_FEDERATION_COMMAND} "
         ):
+            return self._handle_federation_command(event, prompt)
+        return False
+
+    def _handle_federation_command(self, event: KeyPressEvent, prompt: str) -> bool:
+        """Show the federation selector or apply its selection."""
+        if prompt.lower() == CHAT_FEDERATION_COMMAND:
+            self.input_buffer.text = f"{CHAT_FEDERATION_COMMAND} "
+            self.input_buffer.cursor_position = len(self.input_buffer.text)
+            self.input_buffer.start_completion(select_first=False)
+            event.app.invalidate()
+            return True
+
+        federation_name = prompt[len(CHAT_FEDERATION_COMMAND) :].strip()
+        if federation_name not in {federation.name for federation in self.federations}:
             self._append_transcript(
-                "class:notice",
-                f"{CHAT_FEDERATION_COMMAND} is currently disabled.\n\n",
+                "class:error",
+                f"Unknown federation: {federation_name}\n\n",
             )
             return True
-        return False
+
+        self.federation = federation_name
+        self.completer.set_federation(federation_name)
+        self.series_id = None
+        self._append_transcript(
+            "class:notice",
+            f"Federation changed to {federation_name}. "
+            f"{CHAT_NEW_CONVERSATION_MESSAGE}\n\n",
+        )
+        return True
 
     def _show_history(self) -> None:
         """Show conversation history for the default chat federation."""
@@ -410,12 +575,38 @@ class ChatApplication:  # pylint: disable=too-many-instance-attributes
         if self.history_block is None:
             return
         entry = self.history_block.entries[self.history_block.selected_index]
-        self._close_history_selection()
-        self.series_id = entry.series_id
-        self._append_transcript(
-            "class:notice",
-            f"Continuing conversation {entry.series_id}.\n\n",
+        try:
+            with flwr_cli_grpc_exc_handler():
+                response = self.stub.GetRunSeries(
+                    GetRunSeriesRequest(series_id=entry.series_id)
+                )
+        except click.ClickException as exc:
+            self._close_history_selection()
+            self._append_transcript("class:error", f"Error: {exc.format_message()}\n\n")
+            return
+
+        if response.series.federation != self.federation:
+            self._close_history_selection()
+            self._append_transcript(
+                "class:error",
+                f"Conversation {entry.series_id} does not belong to "
+                f"{self.federation}.\n\n",
+            )
+            return
+
+        messages = (
+            _parse_conversation_context(response.context)
+            if response.HasField("context")
+            else []
         )
+        self._close_history_selection()
+        self._clear_transcript()
+        self.series_id = entry.series_id
+        for role, text in messages:
+            if role == "user":
+                self._append_user_message(text)
+            else:
+                self._append_markdown_message(text)
 
     def _cancel_history_selection(self) -> None:
         """Close conversation history without selecting a conversation."""
@@ -455,10 +646,12 @@ class ChatApplication:  # pylint: disable=too-many-instance-attributes
                 asyncio.to_thread(self._stop_run, self.run_id)
             )
 
-    async def _run_prompt(self, prompt: str) -> None:
+    async def _run_prompt(
+        self, prompt: str, app_spec: str, fab_hash: str | None
+    ) -> None:
         """Run one blocking chat request outside the UI event loop."""
         try:
-            await asyncio.to_thread(self._run_prompt_sync, prompt)
+            await asyncio.to_thread(self._run_prompt_sync, prompt, app_spec, fab_hash)
         except click.ClickException as exc:
             self._append_transcript("class:error", f"Error: {exc.format_message()}\n\n")
         finally:
@@ -469,11 +662,13 @@ class ChatApplication:  # pylint: disable=too-many-instance-attributes
             self.application.layout.focus(self.input_buffer)
             self.application.invalidate()
 
-    def _run_prompt_sync(self, prompt: str) -> None:
+    def _run_prompt_sync(
+        self, prompt: str, app_spec: str, fab_hash: str | None
+    ) -> None:
         """Start and stream one Flower AgentApp run."""
         # Start a run in the current conversation series.
         self.run_id, self.series_id = start_chat_run(
-            self.stub, prompt, self.federation, self.series_id
+            self.stub, prompt, self.federation, self.series_id, app_spec, fab_hash
         )
 
         if self.cancel_requested:
@@ -484,6 +679,7 @@ class ChatApplication:  # pylint: disable=too-many-instance-attributes
         terminal_event_seen = False
         response_start = len(self.transcript)
         reasoning_block: _DetailsBlock | None = None
+        markdown_block: _MarkdownBlock | None = None
         web_search_blocks: dict[str, _DetailsBlock] = {}
         req_events = StreamRunEventsRequest(run_id=self.run_id)
         # Append streamed response content until the run reaches a terminal event.
@@ -496,7 +692,9 @@ class ChatApplication:  # pylint: disable=too-many-instance-attributes
                         if not response_started:
                             response_started = True
                             self.status = ""
-                        self._append_transcript("", delta)
+                        markdown_block = self._append_markdown_delta(
+                            markdown_block, delta
+                        )
                 elif event_type in {
                     CHAT_REASONING_DELTA_EVENT,
                     CHAT_TOOL_CALL_STARTED_EVENT,
@@ -514,8 +712,6 @@ class ChatApplication:  # pylint: disable=too-many-instance-attributes
                 elif event_type in CHAT_TERMINAL_EVENTS:
                     terminal_event_seen = True
 
-        if response_started:
-            self._append_transcript("", "\n\n")
         if not terminal_event_seen and not self.cancel_requested:
             raise click.ClickException(
                 "Chat run ended before the agent response completed."
@@ -599,6 +795,31 @@ class ChatApplication:  # pylint: disable=too-many-instance-attributes
         self.transcript_revision += 1
         self.application.invalidate()
 
+    def _clear_transcript(self) -> None:
+        """Clear the transcript and reset its scroll position."""
+        self.transcript.clear()
+        self.follow_transcript = True
+        self.transcript_revision += 1
+        self.application.invalidate()
+
+    def _append_markdown_delta(
+        self, block: _MarkdownBlock | None, delta: str
+    ) -> _MarkdownBlock:
+        """Append a streamed delta to one Markdown transcript block."""
+        if block is None:
+            block = _MarkdownBlock()
+            self.transcript.append(block)
+        block.body += delta
+        self.transcript_revision += 1
+        self.application.invalidate()
+        return block
+
+    def _append_markdown_message(self, text: str) -> None:
+        """Append a complete Markdown assistant message to the transcript."""
+        self.transcript.append(_MarkdownBlock(text))
+        self.transcript_revision += 1
+        self.application.invalidate()
+
     def _append_user_message(self, prompt: str) -> None:
         """Append a full-width highlighted user message."""
         # Store logical lines; rendering handles wrapping and row padding.
@@ -625,8 +846,8 @@ class ChatApplication:  # pylint: disable=too-many-instance-attributes
         return [("class:status", f"{frame} {self.status}")]
 
     def _render_agent_name(self) -> StyleAndTextTuples:
-        """Return the agent label with the active federation."""
-        return [("class:agent.name", f" ✿ {CHAT_AGENT_NAME} · {self.federation} ")]
+        """Return the selected agent label with the active federation."""
+        return [("class:agent.name", f" ✿ {self.agent_name} · {self.federation} ")]
 
     def _render_transcript(self) -> StyleAndTextTuples:
         """Return transcript text wrapped to the current terminal width."""
@@ -648,6 +869,8 @@ class ChatApplication:  # pylint: disable=too-many-instance-attributes
             for entry in self.transcript:
                 if isinstance(entry, _DetailsBlock):
                     fragments.extend(self._render_details_block(entry, width))
+                elif isinstance(entry, _MarkdownBlock):
+                    fragments.extend(self._render_markdown_block(entry, width))
                 elif isinstance(entry, _HistoryBlock):
                     fragments.extend(self._render_history_block(entry, width))
                 else:
@@ -678,6 +901,29 @@ class ChatApplication:  # pylint: disable=too-many-instance-attributes
         if block.expanded and block.body:
             body = "\n".join(f"   {line}" for line in block.body.splitlines())
             fragments.append(("class:details.body", f"{body}\n"))
+        fragments.append(("", "\n"))
+        return fragments
+
+    def _render_markdown_block(
+        self, block: _MarkdownBlock, width: int
+    ) -> StyleAndTextTuples:
+        """Render Markdown as prompt_toolkit formatted-text fragments."""
+        console = Console(
+            width=max(1, width),
+            color_system="truecolor",
+            force_terminal=True,
+            markup=False,
+        )
+        fragments: StyleAndTextTuples = []
+        for segment in console.render(Markdown(block.body), console.options):
+            if segment.control or not segment.text:
+                continue
+            style = segment.style
+            if isinstance(style, str):
+                style = console.get_style(style)
+            fragments.append((_rich_style_to_prompt_toolkit(style), segment.text))
+        # Rich terminates each rendered message with one newline. Retain the
+        # blank row that separates messages in the transcript.
         fragments.append(("", "\n"))
         return fragments
 
@@ -747,6 +993,77 @@ def parse_task_event(task_event: TaskEvent) -> tuple[str, JSONObject]:
     return event_type, payload
 
 
+def _parse_conversation_context(context_proto: ProtoContext) -> list[tuple[str, str]]:
+    """Extract displayable user and assistant messages from RunSeries context."""
+    context = context_from_proto(context_proto)
+    record = context.state.get("items")
+    if not isinstance(record, ConfigRecord):
+        return []
+    raw_items = record.get("json")
+    if not isinstance(raw_items, list):
+        return []
+
+    messages: list[tuple[str, str]] = []
+    for raw_item in raw_items:
+        if not isinstance(raw_item, str):
+            continue
+        try:
+            item = json.loads(raw_item)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        role = item.get("role")
+        if role not in {"user", "assistant"}:
+            continue
+        text = _message_item_text(item.get("content"))
+        if text:
+            messages.append((role, text))
+    return messages
+
+
+def _message_item_text(content: object) -> str:
+    """Return plain text from an OpenResponses message content value."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+
+    parts: list[str] = []
+    for part in content:
+        if isinstance(part, str):
+            parts.append(part)
+        elif isinstance(part, dict) and isinstance(part.get("text"), str):
+            parts.append(part["text"])
+    return "".join(parts)
+
+
+def _rich_style_to_prompt_toolkit(style: RichStyle | None) -> str:
+    """Translate a Rich text style into prompt_toolkit style syntax."""
+    if style is None:
+        return ""
+
+    attributes: list[str] = []
+    for enabled, name in (
+        (style.bold, "bold"),
+        (style.italic, "italic"),
+        (style.underline, "underline"),
+        (style.strike, "strike"),
+    ):
+        if enabled:
+            attributes.append(name)
+
+    for color, prefix in ((style.color, "fg:"), (style.bgcolor, "bg:")):
+        if color is None:
+            continue
+        triplet = color.get_truecolor()
+        if triplet is not None:
+            attributes.append(
+                f"{prefix}#{triplet.red:02x}{triplet.green:02x}{triplet.blue:02x}"
+            )
+    return " ".join(attributes)
+
+
 def _resolve_default_chat_federation(federations: list[Federation]) -> str | None:
     """Resolve the account-scoped default federation used by Flower Chat."""
     execution_suffix = f"/{CHAT_DEFAULT_FEDERATION_NAME}"
@@ -759,6 +1076,74 @@ def _resolve_default_chat_federation(federations: list[Federation]) -> str | Non
         if federation.name.endswith(workspace_suffix):
             account_name = federation.name[: -len(workspace_suffix)]
             return f"{account_name}{execution_suffix}"
+    return None
+
+
+def fetch_chat_agents(
+    auth_plugin: CliAuthPlugin, federation: str | None
+) -> list[_Agent]:
+    """Fetch agents available to the authenticated Flower account."""
+    if not isinstance(auth_plugin, OidcCliPlugin) or not auth_plugin.access_token:
+        raise click.ClickException("Missing authentication tokens. Please login first.")
+    headers = {"Authorization": f"Bearer {auth_plugin.access_token}"}
+    url = f"{FLWR_SUPERGRID_API_URL}{CHAT_AGENTS_API_PATH}"
+    try:
+        response = requests.get(
+            url,
+            headers=headers,
+            params={"federation_id": federation} if federation is not None else None,
+            timeout=10,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except (requests.RequestException, ValueError) as exc:
+        raise click.ClickException("Failed to load available agents.") from exc
+
+    return _parse_agents(payload)
+
+
+def _parse_agents(payload: Any) -> list[_Agent]:
+    """Parse the user agents API response into completion entries."""
+    if not isinstance(payload, dict) or not isinstance(
+        raw_agents := payload.get("agents"), list
+    ):
+        raise click.ClickException("Invalid response from the agents API.")
+
+    agents: list[_Agent] = []
+    for raw_agent in raw_agents:
+        if not isinstance(raw_agent, dict):
+            raise click.ClickException("Invalid response from the agents API.")
+        app_spec = raw_agent.get("app_id")
+        display_name = raw_agent.get("display_name")
+        description = raw_agent.get("description")
+        fab_hash = raw_agent.get("fab_hash")
+        if not (
+            isinstance(app_spec, str)
+            and re.fullmatch(APP_ID_PATTERN, app_spec) is not None
+            and isinstance(fab_hash, (str, NoneType))
+            and isinstance(display_name, (str, NoneType))
+            and isinstance(description, (str, NoneType))
+        ):
+            raise click.ClickException("Invalid response from the agents API.")
+        display_name = display_name or app_spec
+        description = description or display_name
+        agents.append(_Agent(app_spec, display_name, description, fab_hash))
+    return agents
+
+
+def _extract_agent_selection(prompt: str) -> tuple[str | None, str]:
+    """Extract a leading agent app spec from a chat prompt."""
+    parts = prompt.split(maxsplit=1)
+    if not parts or re.fullmatch(APP_ID_PATTERN, parts[0]) is None:
+        return None, prompt
+    return parts[0], parts[1] if len(parts) == 2 else ""
+
+
+def _find_agent(app_spec: str, agents: list[_Agent]) -> _Agent | None:
+    """Find an agent by app spec."""
+    for agent in agents:
+        if agent.app_spec == app_spec:
+            return agent
     return None
 
 
@@ -792,18 +1177,22 @@ def _truncate_to_width(text: str, width: int) -> str:
     return f"{''.join(truncated)}{ellipsis}"
 
 
-def start_chat_run(
+def start_chat_run(  # pylint: disable=too-many-arguments,too-many-positional-arguments
     stub: ControlStub,
     prompt: str,
     federation: str | None,
     series_id: int | None,
+    app_spec: str = CHAT_FLOWER_AGENT_APP_SPEC,
+    fab_hash: str | None = None,
 ) -> tuple[int, int | None]:
     """Start one Flower AgentApp run."""
     req = StartRunRequest(
-        app_spec=CHAT_FLOWER_AGENT_APP_SPEC,
+        app_spec=app_spec if fab_hash is None else "",
         override_config=user_config_to_proto({CHAT_AGENT_INPUT_KEY: prompt}),
         federation=federation or "",
     )
+    if fab_hash is not None:
+        req.fab.CopyFrom(Fab(hash_str=fab_hash))
     if series_id is not None:
         req.series_id = series_id
 

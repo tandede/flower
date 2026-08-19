@@ -12,31 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""FastAPI task-token authentication dependency for Runtime routes."""
+"""FastAPI task-token authentication dependency for SuperLink Runtime routes."""
 
 from typing import Annotated
 
-from fastapi import Depends, Request
+from fastapi import Depends, Request, Security
 
 from flwr.proto.task_pb2 import Task  # pylint: disable=E0611
 from flwr.server.superlink.linkstate import LinkState
-from flwr.supercore.constant import TASK_TOKEN_HEADER
-from flwr.supercore.error import ApiErrorCode, FlowerError
+from flwr.supercore.dependencies.task import TaskTokenDependency, authenticate_task
 
 from .linkstate import get_linkstate
 
 LinkStateDependency = Annotated[LinkState, Depends(get_linkstate)]
 
 
-def get_task(request: Request, state: LinkStateDependency) -> Task:
+def get_task(
+    request: Request,
+    token: TaskTokenDependency,
+    state: LinkStateDependency,
+) -> Task:
     """Return the task authenticated by the Runtime task-token header."""
-    tokens = request.headers.getlist(TASK_TOKEN_HEADER)
-    # Match gRPC metadata validation and reject ambiguous credentials.
-    token = tokens[0] if len(tokens) == 1 and tokens[0] else None
-    task = state.get_task_by_token(token) if token is not None else None
-    if task is None:
-        raise FlowerError(
-            ApiErrorCode.RUNTIME_AUTHENTICATION_FAILED,
-            "Runtime task-token authentication failed.",
-        )
-    return task
+    return authenticate_task(request, token, state)
+
+
+TaskDependency = Annotated[Task, Security(get_task)]

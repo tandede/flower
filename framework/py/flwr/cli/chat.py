@@ -24,14 +24,21 @@ from flwr.proto.control_pb2 import (  # pylint: disable=E0611
 from flwr.proto.control_pb2_grpc import ControlStub
 
 from .chat_app import ChatApplication
-from .utils import flwr_cli_grpc_exc_handler, init_channel_from_connection
+from .utils import (
+    flwr_cli_grpc_exc_handler,
+    init_channel_from_connection,
+    load_cli_auth_plugin_from_connection,
+)
 
 
 def chat() -> None:
     """Start an interactive chat session with the Flower agent."""
     superlink_connection = read_superlink_connection(CHAT_SUPERGRID_CONNECTION_NAME)
 
-    channel = init_channel_from_connection(superlink_connection)
+    if superlink_connection.address is None:
+        raise ValueError("The SuperGrid connection has no address.")
+    auth_plugin = load_cli_auth_plugin_from_connection(superlink_connection.address)
+    channel = init_channel_from_connection(superlink_connection, auth_plugin)
     stub = ControlStub(channel)
     try:
         # Verify stored credentials before showing the interactive prompt.
@@ -39,6 +46,6 @@ def chat() -> None:
             response: ListFederationsResponse = stub.ListFederations(
                 ListFederationsRequest()
             )
-        ChatApplication(stub, list(response.federations)).run()
+        ChatApplication(stub, list(response.federations), auth_plugin).run()
     finally:
         channel.close()

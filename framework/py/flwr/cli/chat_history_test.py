@@ -15,12 +15,20 @@
 """Tests for conversation history in the CLI `chat` application."""
 
 
+import json
 from unittest.mock import Mock, patch
 
 from prompt_toolkit.utils import get_cwidth
 
-from flwr.cli.chat_app import ChatApplication
-from flwr.proto.control_pb2 import ListRunSeriesRequest, ListRunSeriesResponse
+from flwr.app import ConfigRecord, Context, RecordDict
+from flwr.cli.chat_app import ChatApplication, _MarkdownBlock
+from flwr.common.serde import context_to_proto
+from flwr.proto.control_pb2 import (
+    GetRunSeriesRequest,
+    GetRunSeriesResponse,
+    ListRunSeriesRequest,
+    ListRunSeriesResponse,
+)
 from flwr.proto.federation_pb2 import Federation  # pylint: disable=E0611
 from flwr.proto.runseries_pb2 import RunSeries  # pylint: disable=E0611
 
@@ -30,6 +38,7 @@ def _create_chat(stub: Mock) -> ChatApplication:
         return ChatApplication(
             stub,
             [Federation(name="@flower/flower-agent-execution")],
+            Mock(),
         )
 
 
@@ -75,6 +84,12 @@ def test_history_navigation_tracks_and_confirms_selection() -> None:
             RunSeries(series_id=1, description="Oldest"),
         ]
     )
+    stub.GetRunSeries.return_value = GetRunSeriesResponse(
+        series=RunSeries(
+            series_id=1,
+            federation="@flower/flower-agent-execution",
+        )
+    )
     chat = _create_chat(stub)
     chat._handle_command(Mock(), "/history")  # pylint: disable=protected-access
     assert chat.history_block is not None
@@ -98,7 +113,73 @@ def test_history_navigation_tracks_and_confirms_selection() -> None:
     assert latest_cursor.y > oldest_cursor.y
     assert chat.history_block is None
     assert chat.series_id == 1
-    assert chat.transcript == [("class:notice", "Continuing conversation 1.\n\n")]
+    assert chat.transcript == []
+
+
+def test_history_selection_restores_conversation_context() -> None:
+    """Selecting history should replace the transcript with its saved messages."""
+    stub = Mock()
+    series = RunSeries(
+        series_id=7,
+        federation="@flower/flower-agent-execution",
+        description="Saved conversation",
+    )
+    stub.ListRunSeries.return_value = ListRunSeriesResponse(entries=[series])
+    context = Context(
+        run_id=10,
+        node_id=0,
+        node_config={},
+        state=RecordDict(
+            {
+                "items": ConfigRecord(
+                    {
+                        "json": [
+                            json.dumps(
+                                {
+                                    "type": "message",
+                                    "role": "user",
+                                    "content": "Previous question",
+                                }
+                            ),
+                            json.dumps(
+                                {
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "content": [
+                                        {
+                                            "type": "output_text",
+                                            "text": "Previous answer",
+                                        }
+                                    ],
+                                }
+                            ),
+                            json.dumps({"type": "function_call", "name": "search"}),
+                            "invalid JSON",
+                        ]
+                    }
+                )
+            }
+        ),
+        run_config={},
+        series_id=7,
+    )
+    stub.GetRunSeries.return_value = GetRunSeriesResponse(
+        series=series,
+        context=context_to_proto(context),
+    )
+    chat = _create_chat(stub)
+    chat.transcript = [("", "Current conversation\n\n")]
+    chat._handle_command(Mock(), "/history")  # pylint: disable=protected-access
+
+    chat._confirm_history_selection()  # pylint: disable=protected-access
+
+    stub.GetRunSeries.assert_called_once_with(GetRunSeriesRequest(series_id=7))
+    assert chat.series_id == 7
+    assert chat.transcript == [
+        ("class:user.message", "❯ Previous question\n"),
+        ("", "\n"),
+        _MarkdownBlock("Previous answer"),
+    ]
 
 
 def test_history_handles_empty_result() -> None:

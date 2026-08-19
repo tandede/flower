@@ -187,7 +187,7 @@ class TestControlServicer(unittest.TestCase):  # pylint: disable=R0904
                 FLWR_IN_MEMORY_DB_NAME, NoOpFederationManager(), objectstore_factory
             ),
             objectstore_factory=objectstore_factory,
-            authn_plugin=(authn_plugin := NoOpControlAuthnPlugin(Mock(), False)),
+            authn_plugin=(authn_plugin := NoOpControlAuthnPlugin()),
         )
         account_info = authn_plugin.validate_tokens_in_metadata([])[1]
         assert account_info is not None
@@ -287,7 +287,9 @@ class TestControlServicer(unittest.TestCase):  # pylint: disable=R0904
             )
 
         with patch.object(connector_registry, "OAUTH_FLOWS", {"slack": flow}):
-            response = self.servicer.ListConnectors(ListConnectorsRequest(), Mock())
+            response = self.servicer.ListConnectors(
+                ListConnectorsRequest(federation=NOOP_FEDERATION_ID), Mock()
+            )
             self.assertEqual(len(response.connectors), 1)
             self.assertTrue(response.connectors[0].connected)
 
@@ -301,6 +303,11 @@ class TestControlServicer(unittest.TestCase):  # pylint: disable=R0904
         self.assertIsNotNone(
             self.state.get_connector(flwr_aid="other-account", connector_ref="slack")
         )
+
+    def test_list_connectors_without_federation_returns_empty(self) -> None:
+        """ListConnectors should return no connectors without a federation."""
+        response = self.servicer.ListConnectors(ListConnectorsRequest(), Mock())
+        self.assertEqual(list(response.connectors), [])
 
     def test_connector_oauth_rejects_invalid_or_expired_session(self) -> None:
         """Reject invalid state and expired OAuth sessions before exchange."""
@@ -446,6 +453,55 @@ class TestControlServicer(unittest.TestCase):  # pylint: disable=R0904
 
     @parameterized.expand(  # type: ignore
         [
+            (True, False),
+            (False, True),
+            (True, True),
+        ]
+    )
+    def test_start_run_rejects_connectors_for_capable_federation(
+        self,
+        can_invite_members: bool,
+        can_add_supernodes: bool,
+    ) -> None:
+        """StartRun should restrict connectors to personal-style federations."""
+        self.state.upsert_connector(
+            flwr_aid=self.aid,
+            connector_ref="slack",
+            credentials_json="{}",
+            config_json="{}",
+        )
+        request = StartRunRequest(
+            federation=NOOP_FEDERATION_ID,
+            connector_refs=["slack"],
+        )
+
+        with (
+            patch.object(
+                connector_registry,
+                "OAUTH_FLOWS",
+                {"slack": _OAuthFlow()},
+            ),
+            patch.object(
+                self.state.federation_manager,
+                "get_details",
+                return_value=SimpleNamespace(
+                    can_invite_members=can_invite_members,
+                    can_add_supernodes=can_add_supernodes,
+                ),
+            ),
+            self.assertRaises(FlowerError) as error,
+        ):
+            self.servicer.StartRun(request, Mock())
+
+        self.assertEqual(error.exception.code, ApiErrorCode.INVALID_CONNECTOR_REQUEST)
+        self.assertEqual(
+            error.exception.public_details,
+            "Connectors are currently available only in your personal workspace.",
+        )
+        self.assertEqual(list(self.state.get_run_info()), [])
+
+    @parameterized.expand(  # type: ignore
+        [
             ("unknown", "unknown", ApiErrorCode.CONNECTOR_NOT_FOUND),
             ("empty", "  ", ApiErrorCode.INVALID_CONNECTOR_REQUEST),
             ("other_account", "slack", ApiErrorCode.CONNECTOR_NOT_FOUND),
@@ -580,12 +636,14 @@ class TestControlServicer(unittest.TestCase):  # pylint: disable=R0904
 
         runs = self.state.get_run_info(run_ids=[response.run_id])
         tasks = self.state.get_tasks()
+        apps = self.state.list_apps(NOOP_FEDERATION_ID)
 
         self.assertEqual(len(runs), 1)
         self.assertEqual(runs[0].primary_task_type, expected_primary_task_type)
         self.assertEqual(len(tasks), 1)
         self.assertEqual(tasks[0].run_id, response.run_id)
         self.assertEqual(tasks[0].type, expected_task_type)
+        self.assertEqual(apps[0].app_type, TaskType.SERVER_APP)
 
     def test_start_run_creates_agentapp_run_from_local_fab(self) -> None:
         """Test StartRun creates an AgentApp run for a submitted AgentApp FAB."""
@@ -627,6 +685,7 @@ class TestControlServicer(unittest.TestCase):  # pylint: disable=R0904
         runs = self.state.get_run_info(run_ids=[response.run_id])
         tasks = self.state.get_tasks()
         series = self.state.get_run_series(series_ids=[response.series_id])
+        apps = self.state.list_apps(NOOP_FEDERATION_ID)
 
         self.assertEqual(len(runs), 1)
         self.assertEqual(runs[0].fab_id, "flwr/agent")
@@ -638,6 +697,10 @@ class TestControlServicer(unittest.TestCase):  # pylint: disable=R0904
         self.assertEqual(tasks[0].run_id, response.run_id)
         self.assertEqual(tasks[0].type, TaskType.AGENT_APP)
         self.assertEqual(tasks[0].fab_hash, runs[0].fab_hash)
+        self.assertEqual(
+            [(app.app_id, app.fab_hash, app.app_type) for app in apps],
+            [("@flwr/agent", runs[0].fab_hash, TaskType.AGENT_APP)],
+        )
 
     def test_start_run_creates_builtin_agentapp_run_from_app_spec(self) -> None:
         """Test StartRun creates an AgentApp run for the built-in flwr agent."""
@@ -1170,6 +1233,8 @@ class TestControlServicer(unittest.TestCase):  # pylint: disable=R0904
         self.assertAlmostEqual(retrieved_timestamp, now().timestamp(), delta=1e-1)
         self.assertEqual(response.federation.name, NOOP_FEDERATION_ID)
         self.assertFalse(response.federation.simulation)
+        self.assertFalse(response.federation.can_invite_members)
+        self.assertFalse(response.federation.can_add_supernodes)
 
     def test_list_federations_includes_simulation_flag(self) -> None:
         """Test ListFederations surfaces the federation simulation flag."""
@@ -1181,7 +1246,7 @@ class TestControlServicer(unittest.TestCase):  # pylint: disable=R0904
                 objectstore_factory,
             ),
             objectstore_factory=objectstore_factory,
-            authn_plugin=NoOpControlAuthnPlugin(Mock(), False),
+            authn_plugin=NoOpControlAuthnPlugin(),
         )
 
         response: ListFederationsResponse = servicer.ListFederations(
@@ -1190,6 +1255,8 @@ class TestControlServicer(unittest.TestCase):  # pylint: disable=R0904
 
         self.assertEqual(len(response.federations), 1)
         self.assertTrue(response.federations[0].simulation)
+        self.assertFalse(response.federations[0].can_invite_members)
+        self.assertFalse(response.federations[0].can_add_supernodes)
 
     def test_create_federation_success(self) -> None:
         """Test CreateFederation succeeds when federation_manager.create_federation
@@ -1211,6 +1278,8 @@ class TestControlServicer(unittest.TestCase):  # pylint: disable=R0904
             description=description,
             members=mock_members,
             simulation=True,
+            can_invite_members=True,
+            can_add_supernodes=True,
         )
         manager_calls = Mock()
 
@@ -1261,6 +1330,8 @@ class TestControlServicer(unittest.TestCase):  # pylint: disable=R0904
         self.assertEqual(response.federation.members[0].account.id, self.aid)
         self.assertEqual(response.federation.members[0].role, "owner")
         self.assertTrue(response.federation.simulation)
+        self.assertTrue(response.federation.can_invite_members)
+        self.assertTrue(response.federation.can_add_supernodes)
 
     def test_create_federation_fails_on_manager_error(self) -> None:
         """Test CreateFederation raises when federation_manager.create_federation
@@ -1896,7 +1967,7 @@ class TestValidateFederationAndNodesInRequest(unittest.TestCase):
                 FLWR_IN_MEMORY_DB_NAME, NoOpFederationManager(), objectstore_factory
             ),
             objectstore_factory=objectstore_factory,
-            authn_plugin=(authn_plugin := NoOpControlAuthnPlugin(Mock(), False)),
+            authn_plugin=(authn_plugin := NoOpControlAuthnPlugin()),
         )
         account_info = authn_plugin.validate_tokens_in_metadata([])[1]
         assert account_info is not None
