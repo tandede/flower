@@ -96,7 +96,6 @@ CHAT_AGENT_NAME = "Flower Agent"
 CHAT_EXPERIMENTAL_WARNING = "Note: `flwr chat` is experimental and subject to change."
 CHAT_WELCOME_MESSAGE = "Welcome to the Flower Chat"
 CHAT_EXIT_HINT = f"Type {CHAT_EXIT_COMMAND} or press Ctrl-C to leave."
-CHAT_NEW_CONVERSATION_MESSAGE = "Your next message will start a fresh conversation."
 CHAT_SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 CHAT_FLOWER_LOGO = r"""
 ███████╗██╗      ██████╗ ██╗    ██╗███████╗██████╗

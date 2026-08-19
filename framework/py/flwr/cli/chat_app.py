@@ -78,7 +78,6 @@ from flwr.cli.constant import (
     CHAT_HELP_COMMAND,
     CHAT_HISTORY_COMMAND,
     CHAT_NEW_COMMAND,
-    CHAT_NEW_CONVERSATION_MESSAGE,
     CHAT_REASONING_DELTA_EVENT,
     CHAT_SPINNER_FRAMES,
     CHAT_TERMINAL_EVENTS,
@@ -517,18 +516,14 @@ class ChatApplication:  # pylint: disable=too-many-instance-attributes
         self.federation = federation_name
         self.completer.set_federation(federation_name)
         self.series_id = None
-        self._append_transcript(
-            "class:notice",
-            f"Federation changed to {federation_name}. "
-            f"{CHAT_NEW_CONVERSATION_MESSAGE}\n\n",
-        )
+        self._clear_transcript()
         return True
 
     def _show_history(self) -> None:
-        """Show conversation history for the default chat federation."""
+        """Show conversation history for the active federation."""
         if self.federation is None:
             self._append_transcript(
-                "class:error", "The default chat federation is unavailable.\n\n"
+                "class:error", "The active federation is unavailable.\n\n"
             )
             return
         try:
@@ -539,8 +534,6 @@ class ChatApplication:  # pylint: disable=too-many-instance-attributes
         except click.ClickException as exc:
             self._append_transcript("class:error", f"Error: {exc.format_message()}\n\n")
             return
-        # ListRunSeries returns newest first; render chronologically so the latest
-        # conversation is at the bottom.
         entries = list(reversed(response.entries))
         if not entries:
             self._append_transcript(
@@ -548,14 +541,11 @@ class ChatApplication:  # pylint: disable=too-many-instance-attributes
                 f"No conversation history found for {self.federation}.\n\n",
             )
             return
-        block = _HistoryBlock(
-            self.federation,
-            entries,
-            selected_index=len(entries) - 1,
+        self.history_block = _HistoryBlock(
+            self.federation, entries, selected_index=len(entries) - 1
         )
-        self.history_block = block
         self.follow_transcript = True
-        self.transcript.append(block)
+        self.transcript.append(self.history_block)
         self.transcript_revision += 1
         self.application.invalidate()
 
@@ -563,15 +553,14 @@ class ChatApplication:  # pylint: disable=too-many-instance-attributes
         """Move the highlighted conversation history row."""
         if self.history_block is None:
             return
-        entry_count = len(self.history_block.entries)
         self.history_block.selected_index = (
             self.history_block.selected_index + offset
-        ) % entry_count
+        ) % len(self.history_block.entries)
         self.transcript_revision += 1
         self.application.invalidate()
 
     def _confirm_history_selection(self) -> None:
-        """Continue the highlighted conversation."""
+        """Restore and continue the highlighted conversation."""
         if self.history_block is None:
             return
         entry = self.history_block.entries[self.history_block.selected_index]
@@ -606,14 +595,15 @@ class ChatApplication:  # pylint: disable=too-many-instance-attributes
             if role == "user":
                 self._append_user_message(text)
             else:
-                self._append_markdown_message(text)
+                self.transcript.append(_MarkdownBlock(text))
+                self.transcript_revision += 1
+                self.application.invalidate()
 
     def _cancel_history_selection(self) -> None:
-        """Close conversation history without selecting a conversation."""
+        """Close conversation history without changing conversations."""
         if self.history_block is None:
             return
         self._close_history_selection()
-        self._append_transcript("class:notice", "History selection cancelled.\n\n")
 
     def _close_history_selection(self) -> None:
         """Remove the active conversation history block."""
@@ -675,7 +665,6 @@ class ChatApplication:  # pylint: disable=too-many-instance-attributes
             self._stop_run(self.run_id)
             return
 
-        response_started = False
         terminal_event_seen = False
         response_start = len(self.transcript)
         reasoning_block: _DetailsBlock | None = None
@@ -689,12 +678,13 @@ class ChatApplication:  # pylint: disable=too-many-instance-attributes
                 if event_type == CHAT_TEXT_DELTA_EVENT:
                     delta = payload.get("delta")
                     if isinstance(delta, str):
-                        if not response_started:
-                            response_started = True
+                        if markdown_block is None:
                             self.status = ""
-                        markdown_block = self._append_markdown_delta(
-                            markdown_block, delta
-                        )
+                            markdown_block = _MarkdownBlock()
+                            self.transcript.append(markdown_block)
+                        markdown_block.body += delta
+                        self.transcript_revision += 1
+                        self.application.invalidate()
                 elif event_type in {
                     CHAT_REASONING_DELTA_EVENT,
                     CHAT_TOOL_CALL_STARTED_EVENT,
@@ -799,24 +789,6 @@ class ChatApplication:  # pylint: disable=too-many-instance-attributes
         """Clear the transcript and reset its scroll position."""
         self.transcript.clear()
         self.follow_transcript = True
-        self.transcript_revision += 1
-        self.application.invalidate()
-
-    def _append_markdown_delta(
-        self, block: _MarkdownBlock | None, delta: str
-    ) -> _MarkdownBlock:
-        """Append a streamed delta to one Markdown transcript block."""
-        if block is None:
-            block = _MarkdownBlock()
-            self.transcript.append(block)
-        block.body += delta
-        self.transcript_revision += 1
-        self.application.invalidate()
-        return block
-
-    def _append_markdown_message(self, text: str) -> None:
-        """Append a complete Markdown assistant message to the transcript."""
-        self.transcript.append(_MarkdownBlock(text))
         self.transcript_revision += 1
         self.application.invalidate()
 
@@ -957,8 +929,6 @@ class ChatApplication:  # pylint: disable=too-many-instance-attributes
     def _transcript_cursor(self) -> Point:
         """Keep the transcript scrolled to its last line."""
         if self.history_block is not None:
-            # The Window follows this cursor, keeping the highlighted history row
-            # visible as the user moves beyond either viewport edge.
             selected_line = 0
             for fragment in self.wrapped_transcript:
                 if fragment[0] == "class:history.selected":
@@ -1016,26 +986,22 @@ def _parse_conversation_context(context_proto: ProtoContext) -> list[tuple[str, 
         role = item.get("role")
         if role not in {"user", "assistant"}:
             continue
-        text = _message_item_text(item.get("content"))
+        content = item.get("content")
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            parts: list[str] = []
+            for part in content:
+                if isinstance(part, str):
+                    parts.append(part)
+                elif isinstance(part, dict) and isinstance(part.get("text"), str):
+                    parts.append(part["text"])
+            text = "".join(parts)
+        else:
+            continue
         if text:
             messages.append((role, text))
     return messages
-
-
-def _message_item_text(content: object) -> str:
-    """Return plain text from an OpenResponses message content value."""
-    if isinstance(content, str):
-        return content
-    if not isinstance(content, list):
-        return ""
-
-    parts: list[str] = []
-    for part in content:
-        if isinstance(part, str):
-            parts.append(part)
-        elif isinstance(part, dict) and isinstance(part.get("text"), str):
-            parts.append(part["text"])
-    return "".join(parts)
 
 
 def _rich_style_to_prompt_toolkit(style: RichStyle | None) -> str:
@@ -1160,21 +1126,19 @@ def _truncate_to_width(text: str, width: int) -> str:
     """Truncate text to a display-cell width, adding an ellipsis if needed."""
     if get_cwidth(text) <= width:
         return text
-
-    ellipsis = "…"
-    content_width = width - get_cwidth(ellipsis)
+    content_width = width - 1
     if content_width <= 0:
-        return ellipsis if width > 0 else ""
+        return "…" if width else ""
 
-    truncated: list[str] = []
+    chars: list[str] = []
     current_width = 0
     for char in text:
         char_width = get_cwidth(char)
         if current_width + char_width > content_width:
             break
-        truncated.append(char)
+        chars.append(char)
         current_width += char_width
-    return f"{''.join(truncated)}{ellipsis}"
+    return f"{''.join(chars)}…"
 
 
 def start_chat_run(  # pylint: disable=too-many-arguments,too-many-positional-arguments

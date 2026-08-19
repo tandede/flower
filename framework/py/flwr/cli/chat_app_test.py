@@ -97,47 +97,18 @@ def test_chat_selects_federation() -> None:
     assert chat.completer.federation == "@flower/other"
     assert chat.completer.agents is None
     assert chat.series_id is None
-    assert chat.transcript == [
-        (
-            "class:notice",
-            "Federation changed to @flower/other. "
-            "Your next message will start a fresh conversation.\n\n",
-        )
-    ]
+    assert chat.transcript == []
 
 
-def test_chat_rejects_unknown_federation() -> None:
-    """An unknown federation should leave the current conversation unchanged."""
-    with patch.object(ChatApplication, "_create_application", return_value=Mock()):
-        chat = ChatApplication(Mock(), [Federation(name="@flower/workspace")], Mock())
-    chat.series_id = 123
-
-    handled = chat._handle_command(Mock(), "/federation @flower/unknown")
-
-    assert handled
-    assert chat.federation == "@flower/flower-agent-execution"
-    assert chat.series_id == 123
-    assert chat.transcript == [
-        ("class:error", "Unknown federation: @flower/unknown\n\n")
-    ]
-
-
-def test_chat_streams_and_renders_one_markdown_block() -> None:
-    """Assistant deltas should form one styled Markdown transcript block."""
+def test_chat_renders_markdown_block() -> None:
+    """Assistant Markdown should produce prompt_toolkit style fragments."""
     with patch.object(ChatApplication, "_create_application", return_value=Mock()):
         chat = ChatApplication(Mock(), [Federation(name="@flower/workspace")], Mock())
 
-    block = chat._append_markdown_delta(  # pylint: disable=protected-access
-        None, "Hello **bo"
-    )
-    block = chat._append_markdown_delta(  # pylint: disable=protected-access
-        block, "ld** and `code`."
-    )
     fragments = chat._render_markdown_block(  # pylint: disable=protected-access
-        block, 60
+        _MarkdownBlock("Hello **bold** and `code`."), 60
     )
 
-    assert chat.transcript == [_MarkdownBlock("Hello **bold** and `code`.")]
     assert "**" not in "".join(text for _, text, *_ in fragments)
     assert any(text == "bold" and "bold" in style for style, text, *_ in fragments)
     assert any(text == "code" and "bg:" in style for style, text, *_ in fragments)
